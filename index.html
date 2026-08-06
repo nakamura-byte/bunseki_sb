@@ -50,16 +50,60 @@
 
     firebase.initializeApp(firebaseConfig);
     const db = firebase.firestore();
-    // 「bunseki-reports」という保管箱の中の「shared-state」という1件の書類に、
-    // 全レポートのデータをまとめて保存する(全員がこの同じ書類を見る)
-    const docRef = db.collection('bunseki-reports').doc('shared-state');
+    // 「bunseki-reports」という保管箱の中に、レポート1件につき1つの書類を作って保存する
+    // (以前は全レポートを1つの書類にまとめていたが、Firestoreは1書類1MBまでという上限があり、
+    //  画像を貼るとすぐ超えてしまうため、レポートごとに書類を分ける方式に変更した)
+    const collRef = db.collection('bunseki-reports');
+    const metaDocRef = collRef.doc('_meta'); // どのタブが選択中かだけを持つ、小さな書類
+
+    function reportDocRef(id) {
+      return collRef.doc(String(id));
+    }
 
     let state = { reports: [], activeId: null };
 
-    function save() {
-      docRef.set(state).catch(err => {
+    function saveReport(report) {
+      reportDocRef(report.id).set(report).catch(err => {
         console.error('保存に失敗しました:', err);
-        alert('保存に失敗しました。インターネット接続と、Firebaseの設定(firebaseConfig)をご確認ください。');
+        if (String(err && err.message).includes('exceeds the maximum allowed size')) {
+          alert('このレポートのデータ量が大きすぎて保存できませんでした。画像の枚数を減らすか、より軽い画像でお試しください。');
+        } else {
+          alert('保存に失敗しました。インターネット接続と、Firebaseの設定(firebaseConfig)をご確認ください。');
+        }
+      });
+    }
+
+    function saveMeta() {
+      metaDocRef.set({ activeId: state.activeId }).catch(err => {
+        console.error('保存に失敗しました(表示中タブの記録):', err);
+      });
+    }
+
+    // ドロップされた画像を、縦横1000pxを上限に縮小してJPEGに変換してからサイズを抑える
+    // (スクリーンショットのような画像をそのまま保存すると、それだけで1MBの上限に達してしまうため)
+    function compressImageFile(file, maxDim, quality) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const img = new Image();
+          img.onload = () => {
+            let { width, height } = img;
+            if (width > maxDim || height > maxDim) {
+              const scale = Math.min(maxDim / width, maxDim / height);
+              width = Math.round(width * scale);
+              height = Math.round(height * scale);
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', quality));
+          };
+          img.onerror = reject;
+          img.src = reader.result;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
       });
     }
 
@@ -156,7 +200,7 @@
 
     function switchTab(id) {
       state.activeId = id;
-      save();
+      saveMeta();
       render();
     }
 
@@ -165,10 +209,13 @@
       const report = state.reports.find(r => r.id === id);
       if (!confirm(`「${report ? report.title : 'このレポート'}」を削除しますか？この操作は元に戻せません。`)) return;
       state.reports = state.reports.filter(r => r.id !== id);
+      let activeChanged = false;
       if (state.activeId === id) {
         state.activeId = state.reports.length > 0 ? state.reports[0].id : null;
+        activeChanged = true;
       }
-      save();
+      reportDocRef(id).delete().catch(err => console.error('削除に失敗しました:', err));
+      if (activeChanged) saveMeta();
       render();
     }
 
@@ -176,7 +223,7 @@
       const report = currentReport();
       if (!report) return;
       report.title = text.trim() || 'レポートタイトル';
-      save();
+      saveReport(report);
       renderTabs();
     }
 
@@ -184,7 +231,7 @@
       const report = currentReport();
       if (!report || !report.blocks[index]) return;
       report.blocks[index][field] = value.trim();
-      save();
+      saveReport(report);
       if (field === 'videoUrl') renderVideoEmbed(document.getElementById(`video-embed-${index}`), value.trim(), document.getElementById(`video-link-${index}`));
       if (field === 'lpUrl') renderLpEmbed(document.getElementById(`lp-embed-${index}`), value.trim(), document.getElementById(`lp-link-${index}`));
     }
@@ -204,15 +251,16 @@
       const file = e.dataTransfer.files && e.dataTransfer.files[0];
       if (!file || !file.type.startsWith('image/')) return;
 
-      const reader = new FileReader();
-      reader.onload = () => {
+      compressImageFile(file, 1000, 0.72).then(dataUrl => {
         const report = currentReport();
         if (!report || !report.blocks[index]) return;
-        report.blocks[index][field] = reader.result;
-        save();
+        report.blocks[index][field] = dataUrl;
+        saveReport(report);
         renderContent();
-      };
-      reader.readAsDataURL(file);
+      }).catch(err => {
+        console.error('画像の処理に失敗しました:', err);
+        alert('画像の読み込みに失敗しました。別の画像でお試しください。');
+      });
     }
 
     function openLightbox(src) {
@@ -233,7 +281,7 @@
       const report = currentReport();
       if (!report) return;
       report.blocks.push(defaultBlock('他社'));
-      save();
+      saveReport(report);
       renderContent();
     }
 
@@ -251,9 +299,12 @@
       const name = document.getElementById('modalInput').value.trim();
       if (!name) return;
       const id = Date.now();
-      state.reports.push({ id, title: name, blocks: [defaultBlock('自社'), defaultBlock('他社')] });
+      const order = state.reports.length ? Math.max(...state.reports.map(r => r.order || 0)) + 1 : 0;
+      const report = { id, title: name, order, blocks: [defaultBlock('自社'), defaultBlock('他社')] };
+      state.reports.push(report);
       state.activeId = id;
-      save();
+      saveReport(report);
+      saveMeta();
       closeModal();
       render();
     }
@@ -263,28 +314,81 @@
       if (e.key === 'Escape') closeModal();
     });
 
+    // 以前のバージョン(全レポートを1つの書類にまとめる方式)で保存されたデータが残っていれば、
+    // 新しい方式(レポートごとに書類を分ける方式)に1回だけ自動で移行する
+    async function migrateLegacyDocIfNeeded() {
+      const metaSnap = await metaDocRef.get();
+      if (metaSnap.exists) return; // 既に新方式に移行済み
+
+      const legacyRef = collRef.doc('shared-state');
+      const legacySnap = await legacyRef.get();
+      if (!legacySnap.exists) return; // 移行対象の古いデータなし
+
+      const legacyData = legacySnap.data() || {};
+      const reports = Array.isArray(legacyData.reports) ? legacyData.reports : [];
+      if (reports.length === 0) return;
+
+      const batch = db.batch();
+      reports.forEach((r, i) => {
+        batch.set(collRef.doc(String(r.id)), { ...r, order: i });
+      });
+      batch.set(metaDocRef, { activeId: legacyData.activeId ?? reports[0].id });
+      batch.delete(legacyRef);
+      await batch.commit();
+    }
+
     // Firestore(共有データ庫)とリアルタイムに同期する。
     // 自分・他の人のどちらが編集しても、ここが呼ばれて画面が最新状態に更新される。
-    docRef.onSnapshot(snap => {
-      if (snap.metadata.hasPendingWrites) {
-        // 自分がいま保存した内容が返ってきただけなので、二重描画・入力カーソル位置飛びを避けるために無視する
-        return;
-      }
-      if (snap.exists) {
-        state = snap.data();
-      } else {
-        // まだ誰も何も保存していない(初回)場合のみ、「分析手法」タブを1件用意する
-        const id = Date.now();
-        state = { reports: [{ id, title: '分析手法', blocks: [defaultBlock('自社'), defaultBlock('他社')] }], activeId: id };
-        save();
-      }
-      if (!state.activeId && state.reports.length > 0) {
-        state.activeId = state.reports[0].id;
-      }
-      render();
-    }, err => {
-      console.error('同期エラー:', err);
-      alert('データの同期に失敗しました。Firebaseの設定(firebaseConfig)、または通信環境をご確認ください。');
+    function startSync() {
+      collRef.onSnapshot(snap => {
+        if (snap.metadata.hasPendingWrites) {
+          // 自分がいま保存した内容が返ってきただけなので、二重描画・入力カーソル位置飛びを避けるために無視する
+          return;
+        }
+
+        if (snap.empty) {
+          // まだ誰も何も保存していない(本当の初回)場合のみ、「分析手法」タブを1件用意する
+          const id = Date.now();
+          const initialReport = { id, title: '分析手法', order: 0, blocks: [defaultBlock('自社'), defaultBlock('他社')] };
+          state = { reports: [initialReport], activeId: id };
+          saveReport(initialReport);
+          saveMeta();
+          render();
+          return;
+        }
+
+        const reports = [];
+        let metaActiveId = null;
+        snap.forEach(doc => {
+          if (doc.id === '_meta') {
+            metaActiveId = doc.data().activeId ?? null;
+            return;
+          }
+          const data = doc.data();
+          // 想定した形(id・blocksを持つ)以外の書類(移行漏れ等)は無視する
+          if (data && typeof data.id !== 'undefined' && Array.isArray(data.blocks)) {
+            reports.push(data);
+          }
+        });
+        reports.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+        state = {
+          reports,
+          activeId: (metaActiveId !== null && reports.some(r => r.id === metaActiveId))
+            ? metaActiveId
+            : (reports[0] ? reports[0].id : null)
+        };
+        render();
+      }, err => {
+        console.error('同期エラー:', err);
+        alert('データの同期に失敗しました。Firebaseの設定(firebaseConfig)、または通信環境をご確認ください。');
+      });
+    }
+
+    migrateLegacyDocIfNeeded().catch(err => {
+      console.error('データ移行に失敗しました:', err);
+    }).finally(() => {
+      startSync();
     });
   </script>
 </body>
