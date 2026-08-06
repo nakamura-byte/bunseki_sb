@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>分析レポート</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%233d5afe'/><rect x='8' y='18' width='4' height='8' rx='1.5' fill='%23fff'/><rect x='14' y='13' width='4' height='13' rx='1.5' fill='%23fff' opacity='.85'/><rect x='20' y='8' width='4' height='18' rx='1.5' fill='%23fff' opacity='.7'/></svg>">
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+  <div class="tab-bar" id="tabBar">
+    <button class="add-tab-btn" onclick="openModal()" title="レポートを追加">＋</button>
+  </div>
+
+  <div class="page page-wide" id="content"></div>
+
+  <div class="modal-overlay" id="modal">
+    <div class="modal">
+      <h3>レポート名を入力</h3>
+      <input type="text" id="modalInput" placeholder="例：分析手法" maxlength="40">
+      <div class="modal-btns">
+        <button class="btn-cancel" onclick="closeModal()">キャンセル</button>
+        <button class="btn-ok" onclick="addReportTab()">追加</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="image-lightbox" id="imageLightbox" onclick="closeLightbox()">
+    <button class="lightbox-close" onclick="closeLightbox()" aria-label="閉じる">×</button>
+    <img id="lightboxImg" src="" alt="" onclick="event.stopPropagation()">
+  </div>
+
+  <!-- ここから: 全員でリアルタイム共有するための仕組み(Firebase / 無料)を読み込み -->
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+  <!-- ここまで -->
+
+  <script src="assets/js/report.js"></script>
+  <script>
+    // ▼▼▼ ここに、Firebaseコンソールで発行される「あなたの設定」をそのまま貼り付けてください ▼▼▼
+    const firebaseConfig = {
+      apiKey: "AIzaSyAUOpEFl4N6tMbfCEvvbS_j9J8dcH6-jVo",
+      authDomain: "kizibunseki-sb.firebaseapp.com",
+      projectId: "kizibunseki-sb",
+      storageBucket: "kizibunseki-sb.firebasestorage.app",
+      messagingSenderId: "800481780418",
+      appId: "1:800481780418:web:43b618be36656b7133115b"
+    };
+    // ▲▲▲ ここまで ▲▲▲
+
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.firestore();
+    // 「bunseki-reports」という保管箱の中の「shared-state」という1件の書類に、
+    // 全レポートのデータをまとめて保存する(全員がこの同じ書類を見る)
+    const docRef = db.collection('bunseki-reports').doc('shared-state');
+
+    let state = { reports: [], activeId: null };
+
+    function save() {
+      docRef.set(state).catch(err => {
+        console.error('保存に失敗しました:', err);
+        alert('保存に失敗しました。インターネット接続と、Firebaseの設定(firebaseConfig)をご確認ください。');
+      });
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function defaultBlock(label) {
+      return { label: label || '他社', videoUrl: '', videoText: '自由記載', videoImage: '', lpUrl: '', lpText: '自由記載', lpImage: '' };
+    }
+
+    function currentReport() {
+      return state.reports.find(r => r.id === state.activeId);
+    }
+
+    function render() {
+      renderTabs();
+      renderContent();
+    }
+
+    function renderTabs() {
+      const bar = document.getElementById('tabBar');
+      const addBtn = '<button class="add-tab-btn" onclick="openModal()" title="レポートを追加">＋</button>';
+
+      const tabs = state.reports.map(r => `
+        <div class="tab ${r.id === state.activeId ? 'active' : ''}" onclick="switchTab(${r.id})">
+          ${escapeHtml(r.title)}
+          <button class="tab-close" onclick="deleteReport(event, ${r.id})">×</button>
+        </div>
+      `).join('');
+
+      bar.innerHTML = tabs + addBtn;
+    }
+
+    function renderContent() {
+      const el = document.getElementById('content');
+
+      if (state.reports.length === 0) {
+        el.innerHTML = `
+          <div class="empty-state">
+            <p>レポートがありません</p>
+            <button onclick="openModal()">＋ レポートを追加</button>
+          </div>`;
+        return;
+      }
+
+      const report = currentReport();
+      if (!report) return;
+
+      const blocksHtml = report.blocks.map((b, i) => `
+        <section class="compare-block">
+          <div class="block-label" contenteditable="true" spellcheck="false" onblur="updateBlockField(${i}, 'label', this.textContent)">${escapeHtml(b.label)}</div>
+          <div class="compare-row">
+            <div class="compare-col">
+              <span class="col-label">動画URL</span>
+              <input type="text" class="url-input" value="${escapeHtml(b.videoUrl)}" placeholder="動画のURLを貼り付け" onchange="updateBlockField(${i}, 'videoUrl', this.value)">
+              <div class="media-link" id="video-link-${i}"></div>
+              <div class="media-embed video-embed" id="video-embed-${i}"></div>
+              <div class="image-drop" id="video-image-${i}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleImageDrop(event, ${i}, 'videoImage')">${b.videoImage ? `<img src="${b.videoImage}" alt="" onclick="openLightbox(this.src)">` : '画像をドラッグ&amp;ドロップ'}</div>
+              <div class="free-text" contenteditable="true" spellcheck="false" onblur="updateBlockField(${i}, 'videoText', this.textContent)">${escapeHtml(b.videoText)}</div>
+            </div>
+            <div class="compare-col">
+              <span class="col-label">LP URL</span>
+              <input type="text" class="url-input" value="${escapeHtml(b.lpUrl)}" placeholder="LPのURLを貼り付け" onchange="updateBlockField(${i}, 'lpUrl', this.value)">
+              <div class="media-link" id="lp-link-${i}"></div>
+              <div class="media-embed lp-embed" id="lp-embed-${i}"></div>
+              <div class="image-drop" id="lp-image-${i}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleImageDrop(event, ${i}, 'lpImage')">${b.lpImage ? `<img src="${b.lpImage}" alt="" onclick="openLightbox(this.src)">` : '画像をドラッグ&amp;ドロップ'}</div>
+              <div class="free-text" contenteditable="true" spellcheck="false" onblur="updateBlockField(${i}, 'lpText', this.textContent)">${escapeHtml(b.lpText)}</div>
+            </div>
+          </div>
+        </section>
+      `).join('');
+
+      el.innerHTML = `
+        <h1 class="report-title" contenteditable="true" spellcheck="false" onblur="updateReportTitle(this.textContent)">${escapeHtml(report.title)}</h1>
+        <div class="compare-blocks-row">
+          ${blocksHtml}
+        </div>
+        <div class="add-block-row">
+          <button type="button" class="add-block-btn" onclick="addBlock()">
+            <span class="add-icon">+</span>
+            <span>ブロックを追加</span>
+          </button>
+        </div>
+      `;
+
+      report.blocks.forEach((b, i) => {
+        renderVideoEmbed(document.getElementById(`video-embed-${i}`), b.videoUrl, document.getElementById(`video-link-${i}`));
+        renderLpEmbed(document.getElementById(`lp-embed-${i}`), b.lpUrl, document.getElementById(`lp-link-${i}`));
+      });
+    }
+
+    function switchTab(id) {
+      state.activeId = id;
+      save();
+      render();
+    }
+
+    function deleteReport(e, id) {
+      e.stopPropagation();
+      const report = state.reports.find(r => r.id === id);
+      if (!confirm(`「${report ? report.title : 'このレポート'}」を削除しますか？この操作は元に戻せません。`)) return;
+      state.reports = state.reports.filter(r => r.id !== id);
+      if (state.activeId === id) {
+        state.activeId = state.reports.length > 0 ? state.reports[0].id : null;
+      }
+      save();
+      render();
+    }
+
+    function updateReportTitle(text) {
+      const report = currentReport();
+      if (!report) return;
+      report.title = text.trim() || 'レポートタイトル';
+      save();
+      renderTabs();
+    }
+
+    function updateBlockField(index, field, value) {
+      const report = currentReport();
+      if (!report || !report.blocks[index]) return;
+      report.blocks[index][field] = value.trim();
+      save();
+      if (field === 'videoUrl') renderVideoEmbed(document.getElementById(`video-embed-${index}`), value.trim(), document.getElementById(`video-link-${index}`));
+      if (field === 'lpUrl') renderLpEmbed(document.getElementById(`lp-embed-${index}`), value.trim(), document.getElementById(`lp-link-${index}`));
+    }
+
+    function handleDragOver(e) {
+      e.preventDefault();
+      e.currentTarget.classList.add('drag-over');
+    }
+
+    function handleDragLeave(e) {
+      e.currentTarget.classList.remove('drag-over');
+    }
+
+    function handleImageDrop(e, index, field) {
+      e.preventDefault();
+      e.currentTarget.classList.remove('drag-over');
+      const file = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!file || !file.type.startsWith('image/')) return;
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        const report = currentReport();
+        if (!report || !report.blocks[index]) return;
+        report.blocks[index][field] = reader.result;
+        save();
+        renderContent();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function openLightbox(src) {
+      document.getElementById('lightboxImg').src = src;
+      document.getElementById('imageLightbox').classList.add('show');
+    }
+
+    function closeLightbox() {
+      document.getElementById('imageLightbox').classList.remove('show');
+      document.getElementById('lightboxImg').src = '';
+    }
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeLightbox();
+    });
+
+    function addBlock() {
+      const report = currentReport();
+      if (!report) return;
+      report.blocks.push(defaultBlock('他社'));
+      save();
+      renderContent();
+    }
+
+    function openModal() {
+      document.getElementById('modal').classList.add('show');
+      setTimeout(() => document.getElementById('modalInput').focus(), 50);
+    }
+
+    function closeModal() {
+      document.getElementById('modal').classList.remove('show');
+      document.getElementById('modalInput').value = '';
+    }
+
+    function addReportTab() {
+      const name = document.getElementById('modalInput').value.trim();
+      if (!name) return;
+      const id = Date.now();
+      state.reports.push({ id, title: name, blocks: [defaultBlock('自社'), defaultBlock('他社')] });
+      state.activeId = id;
+      save();
+      closeModal();
+      render();
+    }
+
+    document.getElementById('modalInput').addEventListener('keydown', e => {
+      if (e.key === 'Enter') addReportTab();
+      if (e.key === 'Escape') closeModal();
+    });
+
+    // Firestore(共有データ庫)とリアルタイムに同期する。
+    // 自分・他の人のどちらが編集しても、ここが呼ばれて画面が最新状態に更新される。
+    docRef.onSnapshot(snap => {
+      if (snap.metadata.hasPendingWrites) {
+        // 自分がいま保存した内容が返ってきただけなので、二重描画・入力カーソル位置飛びを避けるために無視する
+        return;
+      }
+      if (snap.exists) {
+        state = snap.data();
+      } else {
+        // まだ誰も何も保存していない(初回)場合のみ、「分析手法」タブを1件用意する
+        const id = Date.now();
+        state = { reports: [{ id, title: '分析手法', blocks: [defaultBlock('自社'), defaultBlock('他社')] }], activeId: id };
+        save();
+      }
+      if (!state.activeId && state.reports.length > 0) {
+        state.activeId = state.reports[0].id;
+      }
+      render();
+    }, err => {
+      console.error('同期エラー:', err);
+      alert('データの同期に失敗しました。Firebaseの設定(firebaseConfig)、または通信環境をご確認ください。');
+    });
+  </script>
+</body>
+</html>
